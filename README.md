@@ -3,7 +3,7 @@
 RMD script to generate WGCNA gene networks for rat in vivo liver data (TG-GATEs and DrugMatrix)
 
 **Overall description:**
-RMD file contains different sections to run WGCNA module generation on the TG-GATEs and DrugMatrix in vivo rat kidney data separately and combined. The parameters of the WGCNA are defined in the Setup section. Finally module preservation was also evaluated using the different modules structions from TG and DM combined or separately.
+RMD file contains different sections to run WGCNA module generation on the TG-GATEs and DrugMatrix in vivo rat kidney data separately and combined. The parameters of the WGCNA are defined in the Setup section. Finally, the module preservation was also evaluated using the different modules structures from TG and DM combined or separately.
 
 **Folder structure:**
 - input data: in folder DATA/
