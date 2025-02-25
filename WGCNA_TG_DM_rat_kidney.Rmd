@@ -1,6 +1,10 @@
 ---
 title: "WGCNA_TG_DM_rat_kidney"
-author: "S.J. Kunnen"
+author:
+  - name: "Steven J. Kunnen"
+    url: "https://orcid.org/0000-0001-9549-1719"
+    affiliation: "Leiden University"
+    affiliation_url: "https://ror.org/027bh9e22"
 date: "`r Sys.Date()`"
 output: html_document
 ---
