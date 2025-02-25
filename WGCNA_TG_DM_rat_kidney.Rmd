@@ -1,0 +1,901 @@
+---
+title: "WGCNA_TG_DM_rat_kidney"
+author: "S.J. Kunnen"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+# Setup
+```{r setup}
+# Setup of WGCNA input parameters and files
+username = Sys.getenv("USERNAME")
+softpower = 8
+min_module_size = 5
+deepsplit = 4
+cutheight = 0.2 # Corresponds to a correlation threshold of 0.8 (1 - 0.8 = 0.2)
+verbose = 3
+network_type = "unsigned"
+method = "average"
+expression_file = "RG230-2.kidney_13582geneExpression_DM_TGexprs_brainarray.csv"
+```
+
+
+# Load libraries
+```{r, message=FALSE}
+if(!require("BiocManager", quietly = TRUE)) install.packages("BiocManager") 
+library(BiocManager)
+
+BiocManager::install(c("org.Hs.eg.db", "org.Mm.eg.db", "GO.db", "impute", "minet", "preprocessCore"))
+
+if(!require("pacman", quietly = TRUE)) install.packages("pacman") 
+library(pacman)
+
+p_load(tidyverse, data.table, parallel, patchwork, readxl, WGCNA, dynamicTreeCut, fastcluster, flashClust, RColorBrewer, devtools, plotly)
+
+if(WGCNA::WGCNAnThreads()==1) {
+  WGCNA::enableWGCNAThreads(nThreads = floor(parallel::detectCores() * 0.8))
+}
+
+inputDir <- file.path(getwd(), "DATA")
+
+outputDir <- file.path(getwd(), "OUTPUT")
+
+# create data_id output folder
+if(!dir.exists(outputDir)){
+  dir.create(path = outputDir)
+}
+
+session_info()
+```
+
+
+# Load data: gene expression log2FC matrix (genes in rows, samples/conditions in columns)
+```{r}
+# Step 1: Load your gene expression data
+# Assume the data is in a CSV file (rows: genes, columns: samples)
+input <- read.csv(file.path(inputDir, expression_file), header = T)
+
+experiment_info <- read_xlsx(file.path(inputDir, "kidney_experiments.xlsx"))
+
+expression_data <- input |>
+  mutate(entrez_id = paste0("id_", geneid)) |>
+  dplyr::select(entrez_id, contains("EXP_")) |>
+  column_to_rownames("entrez_id") |>
+  t() |>
+  as.data.frame()
+
+# Step 2: Data Cleaning
+# Remove genes and samples with too many missing values
+goodSamplesGenes <- goodSamplesGenes(expression_data, verbose = verbose)
+
+expression_data <- expression_data[goodSamplesGenes$goodSamples, goodSamplesGenes$goodGenes]
+
+# Step 3: Z-scale the data (center and scale)
+expression_data_zscaled <- data.frame(scale(x = expression_data, center = T, scale = T))
+expression_data_zscaled_check <- data.frame(apply(expression_data, 2, function(x) (x-mean(x))/sd(x)))
+```
+
+
+# WGCNA TG + DM combined
+
+## 1a. Soft-threshold Selection: This step helps select an appropriate power value to ensure the network follows a scale-free topology.
+```{r}
+powers <- c(1:20)
+
+# Calculate scale-free topology fit using soft power range
+soft_data <- WGCNA::pickSoftThreshold(data = expression_data,
+                                       powerVector = powers,
+                                       verbose = verbose,
+                                       blockSize = 2000,
+                                       networkType = network_type,
+                                       nBreaks = 10) 
+
+soft_data_zscaled <- WGCNA::pickSoftThreshold(data = expression_data_zscaled,
+                                               powerVector = powers,
+                                               verbose = verbose,
+                                               blockSize = 2000,
+                                               networkType = network_type,
+                                               nBreaks = 10) 
+
+soft_data$fitIndices <- soft_data$fitIndices |>
+    dplyr::mutate(r = -sign(slope) * SFT.R.sq)
+
+soft_data_zscaled$fitIndices <- soft_data$fitIndices |>
+    dplyr::mutate(r = -sign(slope) * SFT.R.sq)
+
+# Plot the results to decide the best soft threshold
+par(mfrow = c(1, 2))
+plot(soft_data$fitIndices[, 1], -sign(soft_data$fitIndices[, 3]) * soft_data$fitIndices[, 2],
+     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit, signed R^2",
+     type = "n", main = "Scale independence")
+text(soft_data$fitIndices[, 1], -sign(soft_data$fitIndices[, 3]) * soft_data$fitIndices[, 2],
+     labels = powers, cex = 0.9, col = "red")
+abline(h = 0.90, col = "red") # 0.90 scale-free topology criterion
+
+# Mean connectivity as a function of soft-threshold power
+plot(soft_data$fitIndices[, 1], soft_data$fitIndices[, 5],
+     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity", type = "n",
+     main = "Mean connectivity")
+text(soft_data$fitIndices[, 1], soft_data$fitIndices[, 5], labels = powers, cex = 0.9, col = "red")
+
+# plot 1: scale independence scatter plot
+p1 <- ggplot(data = soft_data$fitIndices, mapping = aes(x = Power, y = r, label = Power)) +
+  geom_text(color = "red") +
+  geom_hline(yintercept = 0.9,color = "red") +
+  scale_x_continuous(breaks = powers) +
+  scale_y_continuous(breaks = seq(from = 0, to = 1, by = 0.1), limits = c(0, 1)) +
+  labs(title = paste0("Scale independance"), x = "Softpower", y = "Scale free topology model fit") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p3 <- ggplot(data = soft_data_zscaled$fitIndices, mapping = aes(x = Power, y = r, label = Power)) +
+  geom_text(color = "red") +
+  geom_hline(yintercept = 0.9,color = "red") +
+  scale_x_continuous(breaks = powers) +
+  scale_y_continuous(breaks = seq(from = 0, to = 1, by = 0.1), limits = c(0, 1)) +
+  labs(title = paste0("Scale independance"), x = "Softpower", y = "Scale free topology model fit") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# plot 2: mean connectivity
+p2 <- ggplot(data = soft_data$fitIndices , mapping = aes(x = Power, y = mean.k., label  = Power)) +
+  geom_text(color = "red") +
+  scale_x_continuous(breaks = powers) +
+  scale_y_continuous(transform = "log10", breaks = c(0.01, 0.1, 1, 10, 100, 1000, 10000)) +
+  labs(title = paste0("Mean connectivity"), x = "Softpower", y = "Mean connectivity") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p4 <- ggplot(data = soft_data_zscaled$fitIndices , mapping = aes(x = Power, y = mean.k., label  = Power)) +
+  geom_text(color = "red") +
+  scale_x_continuous(breaks = powers) +
+  scale_y_continuous(transform = "log10", breaks = c(0.01, 0.1, 1, 10, 100, 1000, 10000)) +
+  labs(title = paste0("Mean connectivity"), x = "Softpower", y = "Mean connectivity") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+(p1|p2)/(p3|p4)
+
+ggsave(paste0(outputDir,"/Softpower_plot_TG_DM_",min(powers),"_till_",max(powers),".pdf"), width = 10, height = 10)
+
+# Difference between scale-free topology fit based on normal log2FC or zscaled log2FC
+setdiff(soft_data$fitIndices,soft_data_zscaled$fitIndices)
+
+# Select of adjust the softpower used to run the WGCNA model.
+softpower = 8 # Modify based on the scale free topology plot results
+```
+
+
+## 2a. Construct the Network and hierarchical clustering
+```{r}
+# Adjacency matrix using the soft-thresholding power
+message("Softpower: ", softpower)
+
+message("Adjacency matrix")
+adjacency_matrix = WGCNA::adjacency(datExpr = expression_data,
+                                    type = network_type,
+                                    power = softpower)
+
+
+# Topological Overlap Matrix (TOM)
+message("TOM")
+tom <- WGCNA::TOMsimilarity(adjMat = adjacency_matrix,
+                            TOMType = network_type,
+                            verbose = verbose)
+
+message("disTOM")
+diss_tom <- 1 - tom
+
+# Cluster genes using hierarchical clustering
+message("flashClust")
+geneTree <- fastcluster::hclust(as.dist(diss_tom), method = method)
+dendro <- flashClust::flashClust(as.dist(diss_tom), method = method)
+
+plot(geneTree, main = "Gene Clustering on TOM-based Dissimilarity", sub = "", xlab = "", cex = 0.6)
+plot(dendro, main = "Gene Clustering on TOM-based Dissimilarity", sub = "", xlab = "", cex = 0.6)
+
+identical(round(geneTree$height,3),round(dendro$height,3))
+```
+
+
+## 3a. Module Identification using Dynamic Tree Cut
+```{r}
+# Step 1: Module Identification using Dynamic Tree Cut
+# Use dynamic tree cut to identify modules
+message("cutreeDynamic")
+
+dynamicMods <- cutreeDynamic(dendro = geneTree, 
+                             distM = diss_tom,
+                             deepSplit = deepsplit, 
+                             pamRespectsDendro = FALSE,
+                             minClusterSize = min_module_size,
+                             verbose = verbose)
+
+module_table_premerge <- as.data.frame(table(dynamicMods))
+
+# Convert numeric labels into colors for visualization
+dynamicColors <- labels2colors(dynamicMods)
+table(dynamicColors)
+
+# Plot dendrogram with module colors
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+
+
+# Step 2: Calculate Module Eigengenes
+MEs <- moduleEigengenes(expression_data, colors = dynamicMods)$eigengenes
+
+# Calculate the dissimilarity of module eigengenes
+ME_diss <- 1 - cor(MEs)
+
+# Hierarchical clustering of module eigengenes
+ME_tree <- hclust(as.dist(ME_diss), method = "average")
+plot(ME_tree, main = "Clustering of Module Eigengenes", xlab = "", sub = "")
+
+
+# Step 3: Merge Similar Modules (module eigengenes with correlation > 0.8)
+message("mergeCloseModules")
+
+mergedModules <- mergeCloseModules(exprData = expression_data, 
+                                   colors = dynamicMods, 
+                                   cutHeight = cutheight,
+                                   verbose = verbose,
+                                   iterate = FALSE)
+
+# Get the new merged module colors
+mergedColors <- mergedModules$colors
+
+module_table_postmerge <- as.data.frame(table(mergedColors))
+
+# Get the new merged module eigengenes
+mergedMEs <- mergedModules$newMEs
+
+# Plot dendrogram with merged module colors
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors),
+                    c("Original Modules", "Merged Modules"),
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+
+eg_score_mergedMEs_summary = mergedMEs |> summary() |> as.data.frame() |> select(-Var1) |> 
+  separate(col = Freq, into = c("Stat", "Value"), sep = ":") |> 
+  pivot_wider(names_from = Stat, values_from = Value)
+
+
+# Step 4: Get module definition
+module_definition <- data.frame(module_premerge = paste0("module_",dynamicMods),
+                                module_postmerge = paste0("module_",mergedColors),
+                                entrez_id = colnames(expression_data),
+                                softpower = softpower,
+                                deepsplit = deepsplit,
+                                minclustersize = min_module_size,
+                                cutheight = cutheight) |>
+  dplyr::left_join(y = input |>
+                     mutate(entrez_id = paste0("id_", geneid)) |> 
+                     dplyr::select(gene_symbol, entrez_id), by = "entrez_id")
+
+module_table_merging <- module_definition |> 
+  select(module_premerge, module_postmerge) |>
+  mutate(module_nr = as.integer(str_remove_all(module_postmerge, "module_"))) |> 
+  table() |> as.data.frame() |> 
+  filter(Freq > 0) 
+
+
+# Step 5: Z-score module eigengene scores premerge
+MEs_old_scaled <- data.frame(apply(mergedModules$oldMEs, 2, function(x) (x-mean(x))/sd(x))) 
+
+Cor_MEs_old <- mergedModules$oldMEs |>
+  # column_to_rownames("sample_id") |>
+  cor() |>
+  as.data.frame() |>
+  rownames_to_column("module") |>
+  mutate(module = paste0("module_", module)) |>
+  pivot_longer(cols = where(is.numeric), names_to = "module_cor", values_to = "PearsonR") 
+
+Cor_MEs_old_scaled <- MEs_old_scaled |>
+  # column_to_rownames("sample_id") |>
+  cor() |>
+  as.data.frame() |>
+  rownames_to_column("module") |>
+  mutate(module = paste0("module_", module)) |>
+  pivot_longer(cols = where(is.numeric), names_to = "module_cor", values_to = "PearsonR") 
+
+Cor_MEs_old_merge <- Cor_MEs_old |> filter(PearsonR > 0.80 & PearsonR < 0.99)
+
+Cor_MEs_old_scaled_merge <- Cor_MEs_old_scaled |> filter(PearsonR > 0.80 & PearsonR < 0.99)
+
+
+if(!mergedModules$allOK) {
+  return()
+}
+
+# Step 6: Scale module eigengene scores
+message("Module eigengene score premerge")
+colnames(mergedModules$oldMEs) <- gsub("ME", "", colnames(mergedModules$oldMEs))
+
+eg_score_premerge <- mergedModules$oldMEs |>
+  tibble::rownames_to_column(var = "sample_id")
+
+eg_score_premerge_scaled <- data.frame(apply(mergedModules$oldMEs, 2, function(x) x/sd(x))) |>
+  tibble::rownames_to_column(var = "sample_id")
+
+message("Module eigengene score postmerge")
+colnames(mergedModules$newMEs) <- gsub("ME", "", colnames(mergedModules$newMEs))
+
+eg_score_postmerge <- mergedModules$newMEs |>
+  tibble::rownames_to_column(var = "sample_id")
+
+eg_score_postmerge_scaled <- data.frame(apply(mergedModules$newMEs, 2, function(x) x/sd(x))) |>
+  tibble::rownames_to_column(var = "sample_id")
+
+eg_score_postmerge_summary = eg_score_postmerge |> select(-sample_id) |> summary() |> as.data.frame() |> select(-Var1) |> 
+  separate(col = Freq, into = c("Stat", "Value"), sep = ":") |> 
+  pivot_wider(names_from = Stat, values_from = Value)
+
+eg_score_postmerge_scaled_summary = eg_score_postmerge_scaled |> select(-sample_id)|> summary() |> as.data.frame() |> select(-Var1) |> 
+  separate(col = Freq, into = c("Stat", "Value"), sep = ":") |> 
+  pivot_wider(names_from = Stat, values_from = Value)
+
+
+Cor_MEs_new <- eg_score_postmerge |>
+  column_to_rownames("sample_id") |>
+  cor() |>
+  as.data.frame() |>
+  rownames_to_column("module") |>
+  mutate(module = paste0("module_", module)) |>
+  pivot_longer(cols = where(is.numeric), names_to = "module_cor", values_to = "PearsonR") 
+  
+Cor_MEs_new_merge <- Cor_MEs_new |> filter(PearsonR > 0.80 & PearsonR < 0.99)
+```
+
+
+# WGCNA TG data
+
+## 1b. TG: Soft-threshold Selection: This step helps select an appropriate power value to ensure the network follows a scale-free topology.
+```{r}
+# Subset expression_data
+experiment_TG = experiment_info |>
+  filter(Source == "TGGates", TISSUE_NAME == "KIDNEY") |>
+  mutate(EXP_NAME = paste0("EXP_", EXPERIMENT))
+  
+expression_data_TG = expression_data |> 
+  rownames_to_column("experiment") |>
+  filter(experiment %in% experiment_TG$EXP_NAME) |>
+  column_to_rownames("experiment") 
+
+expression_data_zscaled_TG <- data.frame(scale(x = expression_data_TG, center = T, scale = T))
+
+powers <- c(1:20)
+
+# Calculate scale-free topology fit using soft power range
+soft_data_TG <- WGCNA::pickSoftThreshold(data = expression_data_TG,
+                                       powerVector = powers,
+                                       verbose = verbose,
+                                       blockSize = 2000,
+                                       networkType = network_type,
+                                       nBreaks = 10) 
+
+soft_data_zscaled_TG <- WGCNA::pickSoftThreshold(data = expression_data_zscaled_TG,
+                                               powerVector = powers,
+                                               verbose = verbose,
+                                               blockSize = 2000,
+                                               networkType = network_type,
+                                               nBreaks = 10) 
+
+soft_data_TG$fitIndices <- soft_data_TG$fitIndices |>
+    dplyr::mutate(r = -sign(slope) * SFT.R.sq)
+
+soft_data_zscaled_TG$fitIndices <- soft_data_TG$fitIndices |>
+    dplyr::mutate(r = -sign(slope) * SFT.R.sq)
+
+# Plot the results to decide the best soft threshold
+par(mfrow = c(1, 2))
+plot(soft_data_TG$fitIndices[, 1], -sign(soft_data_TG$fitIndices[, 3]) * soft_data_TG$fitIndices[, 2],
+     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit, signed R^2",
+     type = "n", main = "Scale independence")
+text(soft_data_TG$fitIndices[, 1], -sign(soft_data_TG$fitIndices[, 3]) * soft_data_TG$fitIndices[, 2],
+     labels = powers, cex = 0.9, col = "red")
+abline(h = 0.90, col = "red") # 0.90 scale-free topology criterion
+
+# Mean connectivity as a function of soft-threshold power
+plot(soft_data_TG$fitIndices[, 1], soft_data_TG$fitIndices[, 5],
+     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity", type = "n",
+     main = "Mean connectivity")
+text(soft_data_TG$fitIndices[, 1], soft_data_TG$fitIndices[, 5], labels = powers, cex = 0.9, col = "red")
+
+# plot 1: scale independence scatter plot
+p1 <- ggplot(data = soft_data_TG$fitIndices, mapping = aes(x = Power, y = r, label = Power)) +
+  geom_text(color = "red") +
+  geom_hline(yintercept = 0.9,color = "red") +
+  scale_x_continuous(breaks = powers) +
+  scale_y_continuous(breaks = seq(from = 0, to = 1, by = 0.1), limits = c(0, 1)) +
+  labs(title = paste0("Scale independance"), x = "Softpower", y = "Scale free topology model fit") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p3 <- ggplot(data = soft_data_zscaled_TG$fitIndices, mapping = aes(x = Power, y = r, label = Power)) +
+  geom_text(color = "red") +
+  geom_hline(yintercept = 0.9,color = "red") +
+  scale_x_continuous(breaks = powers) +
+  scale_y_continuous(breaks = seq(from = 0, to = 1, by = 0.1), limits = c(0, 1)) +
+  labs(title = paste0("Scale independance"), x = "Softpower", y = "Scale free topology model fit") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# plot 2: mean connectivity
+p2 <- ggplot(data = soft_data_TG$fitIndices , mapping = aes(x = Power, y = mean.k., label  = Power)) +
+  geom_text(color = "red") +
+  scale_x_continuous(breaks = powers) +
+  scale_y_continuous(transform = "log10", breaks = c(0.01, 0.1, 1, 10, 100, 1000, 10000)) +
+  labs(title = paste0("Mean connectivity"), x = "Softpower", y = "Mean connectivity") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p4 <- ggplot(data = soft_data_zscaled_TG$fitIndices , mapping = aes(x = Power, y = mean.k., label  = Power)) +
+  geom_text(color = "red") +
+  scale_x_continuous(breaks = powers) +
+  scale_y_continuous(transform = "log10", breaks = c(0.01, 0.1, 1, 10, 100, 1000, 10000)) +
+  labs(title = paste0("Mean connectivity"), x = "Softpower", y = "Mean connectivity") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+(p1|p2)/(p3|p4)
+
+ggsave(paste0(outputDir,"/Softpower_plot_TG_",min(powers),"_till_",max(powers),".pdf"), width = 10, height = 10)
+
+# Difference between scale-free topology fit based on normal log2FC or zscaled log2FC
+setdiff(soft_data_TG$fitIndices,soft_data_zscaled_TG$fitIndices)
+
+# Select of adjust the softpower used to run the WGCNA model.
+softpower = 8 # Modify based on the scale free topology plot results
+```
+
+
+## 2b. TG: Construct the Network and hierarchical clustering
+```{r}
+# Adjacency matrix using the soft-thresholding power
+message("Softpower: ", softpower)
+
+message("Adjacency matrix")
+adjacency_matrix_TG = WGCNA::adjacency(datExpr = expression_data_TG,
+                                    type = network_type,
+                                    power = softpower)
+
+
+# Topological Overlap Matrix (TOM)
+message("TOM")
+tom_TG <- WGCNA::TOMsimilarity(adjMat = adjacency_matrix_TG,
+                            TOMType = network_type,
+                            verbose = verbose)
+
+message("disTOM")
+diss_tom_TG <- 1 - tom_TG
+
+# Cluster genes using hierarchical clustering
+message("flashClust")
+geneTree_TG <- fastcluster::hclust(as.dist(diss_tom_TG), method = method)
+dendro_TG <- flashClust::flashClust(as.dist(diss_tom_TG), method = method)
+
+plot(geneTree_TG, main = "Gene Clustering on TOM-based Dissimilarity", sub = "", xlab = "", cex = 0.6)
+plot(dendro_TG, main = "Gene Clustering on TOM-based Dissimilarity", sub = "", xlab = "", cex = 0.6)
+
+identical(round(geneTree_TG$height,3),round(dendro_TG$height,3))
+```
+
+
+## 3b. TG: Module Identification using Dynamic Tree Cut
+```{r}
+# Step 1: Module Identification using Dynamic Tree Cut
+# Use dynamic tree cut to identify modules
+message("cutreeDynamic")
+
+dynamicMods_TG <- cutreeDynamic(dendro = geneTree_TG, 
+                             distM = diss_tom_TG,
+                             deepSplit = deepsplit, 
+                             pamRespectsDendro = FALSE,
+                             minClusterSize = min_module_size,
+                             verbose = verbose)
+
+module_table_premerge_TG <- as.data.frame(table(dynamicMods_TG))
+
+# Convert numeric labels into colors for visualization
+dynamicColors_TG <- labels2colors(dynamicMods_TG)
+table(dynamicColors_TG)
+
+# Plot dendrogram with module colors
+plotDendroAndColors(geneTree, dynamicColors_TG, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+
+
+# Step 2: Calculate Module Eigengenes
+MEs_TG <- moduleEigengenes(expression_data_TG, colors = dynamicMods_TG)$eigengenes
+
+# Calculate the dissimilarity of module eigengenes
+ME_diss_TG <- 1 - cor(MEs_TG)
+
+# Hierarchical clustering of module eigengenes
+ME_tree_TG <- hclust(as.dist(ME_diss_TG), method = "average")
+plot(ME_tree_TG, main = "Clustering of Module Eigengenes", xlab = "", sub = "")
+
+
+# Step 3: Merge Similar Modules (module eigengenes with correlation > 0.8)
+message("mergeCloseModules")
+
+mergedModules_TG <- mergeCloseModules(exprData = expression_data_TG, 
+                                   colors = dynamicMods_TG, 
+                                   cutHeight = cutheight,
+                                   verbose = verbose,
+                                   iterate = FALSE)
+
+# Get the new merged module colors
+mergedColors_TG <- mergedModules_TG$colors
+
+module_table_postmerge_TG <- as.data.frame(table(mergedColors_TG))
+
+# Get the new merged module eigengenes
+mergedMEs_TG <- mergedModules_TG$newMEs
+
+# Plot dendrogram with merged module colors
+plotDendroAndColors(geneTree, cbind(dynamicColors_TG, mergedColors_TG),
+                    c("Original Modules", "Merged Modules"),
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+
+eg_score_mergedMEs_summary = mergedMEs_TG |> summary() |> as.data.frame() |> select(-Var1) |> 
+  separate(col = Freq, into = c("Stat", "Value"), sep = ":") |> 
+  pivot_wider(names_from = Stat, values_from = Value)
+
+
+# Step 4: Get module definition
+module_definition_TG <- data.frame(module_premerge = paste0("module_",dynamicMods_TG),
+                                module_postmerge = paste0("module_",mergedColors_TG),
+                                entrez_id = colnames(expression_data_TG),
+                                softpower = softpower,
+                                deepsplit = deepsplit,
+                                minclustersize = min_module_size,
+                                cutheight = cutheight) |>
+  dplyr::left_join(y = input |>
+                     mutate(entrez_id = paste0("id_", geneid)) |> 
+                     dplyr::select(gene_symbol, entrez_id), by = "entrez_id")
+
+module_table_merging_TG <- module_definition_TG |> 
+  select(module_premerge, module_postmerge) |>
+  mutate(module_nr = as.integer(str_remove_all(module_postmerge, "module_"))) |> 
+  table() |> as.data.frame() |> 
+  filter(Freq > 0) 
+```
+
+
+# WGCNA DM data
+
+## 1c. DM: Soft-threshold Selection: This step helps select an appropriate power value to ensure the network follows a scale-free topology.
+```{r}
+# Subset expression_data
+experiment_DM = experiment_info |>
+  filter(Source == "DM", TISSUE_NAME == "KIDNEY") |>
+  mutate(EXP_NAME = paste0("EXP_", EXPERIMENT))
+  
+expression_data_DM = expression_data |> 
+  rownames_to_column("experiment") |>
+  filter(experiment %in% experiment_DM$EXP_NAME) |>
+  column_to_rownames("experiment") 
+
+expression_data_zscaled_DM <- data.frame(scale(x = expression_data_DM, center = T, scale = T))
+
+powers <- c(1:20)
+
+# Calculate scale-free topology fit using soft power range
+soft_data_DM <- WGCNA::pickSoftThreshold(data = expression_data_DM,
+                                       powerVector = powers,
+                                       verbose = verbose,
+                                       blockSize = 2000,
+                                       networkType = network_type,
+                                       nBreaks = 10) 
+
+soft_data_zscaled_DM <- WGCNA::pickSoftThreshold(data = expression_data_zscaled_DM,
+                                               powerVector = powers,
+                                               verbose = verbose,
+                                               blockSize = 2000,
+                                               networkType = network_type,
+                                               nBreaks = 10) 
+
+soft_data_DM$fitIndices <- soft_data_DM$fitIndices |>
+    dplyr::mutate(r = -sign(slope) * SFT.R.sq)
+
+soft_data_zscaled_DM$fitIndices <- soft_data_DM$fitIndices |>
+    dplyr::mutate(r = -sign(slope) * SFT.R.sq)
+
+# Plot the results to decide the best soft threshold
+par(mfrow = c(1, 2))
+plot(soft_data_DM$fitIndices[, 1], -sign(soft_data_DM$fitIndices[, 3]) * soft_data_DM$fitIndices[, 2],
+     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit, signed R^2",
+     type = "n", main = "Scale independence")
+text(soft_data_DM$fitIndices[, 1], -sign(soft_data_DM$fitIndices[, 3]) * soft_data_DM$fitIndices[, 2],
+     labels = powers, cex = 0.9, col = "red")
+abline(h = 0.90, col = "red") # 0.90 scale-free topology criterion
+
+# Mean connectivity as a function of soft-threshold power
+plot(soft_data_DM$fitIndices[, 1], soft_data_DM$fitIndices[, 5],
+     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity", type = "n",
+     main = "Mean connectivity")
+text(soft_data_DM$fitIndices[, 1], soft_data_DM$fitIndices[, 5], labels = powers, cex = 0.9, col = "red")
+
+# plot 1: scale independence scatter plot
+p1 <- ggplot(data = soft_data_DM$fitIndices, mapping = aes(x = Power, y = r, label = Power)) +
+  geom_text(color = "red") +
+  geom_hline(yintercept = 0.9,color = "red") +
+  scale_x_continuous(breaks = powers) +
+  scale_y_continuous(breaks = seq(from = 0, to = 1, by = 0.1), limits = c(0, 1)) +
+  labs(title = paste0("Scale independance"), x = "Softpower", y = "Scale free topology model fit") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p3 <- ggplot(data = soft_data_zscaled_DM$fitIndices, mapping = aes(x = Power, y = r, label = Power)) +
+  geom_text(color = "red") +
+  geom_hline(yintercept = 0.9,color = "red") +
+  scale_x_continuous(breaks = powers) +
+  scale_y_continuous(breaks = seq(from = 0, to = 1, by = 0.1), limits = c(0, 1)) +
+  labs(title = paste0("Scale independance"), x = "Softpower", y = "Scale free topology model fit") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# plot 2: mean connectivity
+p2 <- ggplot(data = soft_data_DM$fitIndices , mapping = aes(x = Power, y = mean.k., label  = Power)) +
+  geom_text(color = "red") +
+  scale_x_continuous(breaks = powers) +
+  scale_y_continuous(transform = "log10", breaks = c(0.01, 0.1, 1, 10, 100, 1000, 10000)) +
+  labs(title = paste0("Mean connectivity"), x = "Softpower", y = "Mean connectivity") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p4 <- ggplot(data = soft_data_zscaled_DM$fitIndices , mapping = aes(x = Power, y = mean.k., label  = Power)) +
+  geom_text(color = "red") +
+  scale_x_continuous(breaks = powers) +
+  scale_y_continuous(transform = "log10", breaks = c(0.01, 0.1, 1, 10, 100, 1000, 10000)) +
+  labs(title = paste0("Mean connectivity"), x = "Softpower", y = "Mean connectivity") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+(p1|p2)/(p3|p4)
+
+ggsave(paste0(outputDir,"/Softpower_plot_DM_",min(powers),"_till_",max(powers),".pdf"), width = 10, height = 10)
+
+# Difference between scale-free topology fit based on normal log2FC or zscaled log2FC
+setdiff(soft_data_DM$fitIndices,soft_data_zscaled_DM$fitIndices)
+
+# Select of adjust the softpower used to run the WGCNA model.
+softpower = 8 # Modify based on the scale free topology plot results
+```
+
+
+## 2c. DM: Construct the Network and hierarchical clustering
+```{r}
+# Adjacency matrix using the soft-thresholding power
+message("Softpower: ", softpower)
+
+message("Adjacency matrix")
+adjacency_matrix_DM = WGCNA::adjacency(datExpr = expression_data_DM,
+                                    type = network_type,
+                                    power = softpower)
+
+
+# Topological Overlap Matrix (TOM)
+message("TOM")
+tom_DM <- WGCNA::TOMsimilarity(adjMat = adjacency_matrix_DM,
+                            TOMType = network_type,
+                            verbose = verbose)
+
+message("disTOM")
+diss_tom_DM <- 1 - tom_DM
+
+# Cluster genes using hierarchical clustering
+message("flashClust")
+geneTree_DM <- fastcluster::hclust(as.dist(diss_tom_DM), method = method)
+dendro_DM <- flashClust::flashClust(as.dist(diss_tom_DM), method = method)
+
+plot(geneTree_DM, main = "Gene Clustering on TOM-based Dissimilarity", sub = "", xlab = "", cex = 0.6)
+plot(dendro_DM, main = "Gene Clustering on TOM-based Dissimilarity", sub = "", xlab = "", cex = 0.6)
+
+identical(round(geneTree_DM$height,3),round(dendro_DM$height,3))
+```
+
+
+## 3c. DM: Module Identification using Dynamic Tree Cut
+```{r}
+# Step 1: Module Identification using Dynamic Tree Cut
+# Use dynamic tree cut to identify modules
+message("cutreeDynamic")
+
+dynamicMods_DM <- cutreeDynamic(dendro = geneTree_DM, 
+                             distM = diss_tom_DM,
+                             deepSplit = deepsplit, 
+                             pamRespectsDendro = FALSE,
+                             minClusterSize = min_module_size,
+                             verbose = verbose)
+
+module_table_premerge_DM <- as.data.frame(table(dynamicMods_DM))
+
+# Convert numeric labels into colors for visualization
+dynamicColors_DM <- labels2colors(dynamicMods_DM)
+table(dynamicColors_DM)
+
+# Plot dendrogram with module colors
+plotDendroAndColors(geneTree, dynamicColors_DM, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+
+
+# Step 2: Calculate Module Eigengenes
+MEs_DM <- moduleEigengenes(expression_data_DM, colors = dynamicMods_DM)$eigengenes
+
+# Calculate the dissimilarity of module eigengenes
+ME_diss_DM <- 1 - cor(MEs_DM)
+
+# Hierarchical clustering of module eigengenes
+ME_tree_DM <- hclust(as.dist(ME_diss_DM), method = "average")
+plot(ME_tree_DM, main = "Clustering of Module Eigengenes", xlab = "", sub = "")
+
+
+# Step 3: Merge Similar Modules (module eigengenes with correlation > 0.8)
+message("mergeCloseModules")
+
+mergedModules_DM <- mergeCloseModules(exprData = expression_data_DM, 
+                                   colors = dynamicMods_DM, 
+                                   cutHeight = cutheight,
+                                   verbose = verbose,
+                                   iterate = FALSE)
+
+# Get the new merged module colors
+mergedColors_DM <- mergedModules_DM$colors
+
+module_table_postmerge_DM <- as.data.frame(table(mergedColors_DM))
+
+# Get the new merged module eigengenes
+mergedMEs_DM <- mergedModules_DM$newMEs
+
+# Plot dendrogram with merged module colors
+plotDendroAndColors(geneTree, cbind(dynamicColors_DM, mergedColors_DM),
+                    c("Original Modules", "Merged Modules"),
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+
+eg_score_mergedMEs_summary = mergedMEs_DM |> summary() |> as.data.frame() |> select(-Var1) |> 
+  separate(col = Freq, into = c("Stat", "Value"), sep = ":") |> 
+  pivot_wider(names_from = Stat, values_from = Value)
+
+
+# Step 4: Get module definition
+module_definition_DM <- data.frame(module_premerge = paste0("module_",dynamicMods_DM),
+                                module_postmerge = paste0("module_",mergedColors_DM),
+                                entrez_id = colnames(expression_data_DM),
+                                softpower = softpower,
+                                deepsplit = deepsplit,
+                                minclustersize = min_module_size,
+                                cutheight = cutheight) |>
+  dplyr::left_join(y = input |>
+                     mutate(entrez_id = paste0("id_", geneid)) |> 
+                     dplyr::select(gene_symbol, entrez_id), by = "entrez_id")
+
+module_table_merging_DM <- module_definition_DM |> 
+  select(module_premerge, module_postmerge) |>
+  mutate(module_nr = as.integer(str_remove_all(module_postmerge, "module_"))) |> 
+  table() |> as.data.frame() |> 
+  filter(Freq > 0) 
+```
+
+
+# Module Preservation
+```{r, include=FALSE}
+## Preservation merged modules
+modules_compare = input |>
+  select(gene_symbol, geneid, probeset) |>
+  mutate(entrez_id = paste0("id_", geneid)) |>
+  left_join(module_definition |> 
+              select(entrez_id, module_premerge, module_postmerge), 
+            by = "entrez_id") |>
+  left_join(module_definition_TG |> 
+              select(entrez_id, module_premerge_TG = module_premerge, module_postmerge_TG = module_postmerge), 
+            by = "entrez_id") |>
+  left_join(module_definition_DM |> 
+              select(entrez_id, module_premerge_DM = module_premerge, module_postmerge_DM = module_postmerge), 
+            by = "entrez_id")
+
+data = list(modules_all = as.data.frame(expression_data),
+            modules_TG = as.data.frame(expression_data_TG),
+            modules_DM = as.data.frame(expression_data_DM))
+
+data = list2multiData(data)
+
+modules = list(modules_all = modules_compare$module_postmerge,
+               modules_TG = modules_compare$module_postmerge_TG,
+               modules_DM = modules_compare$module_postmerge_DM)
+
+module_preservation = modulePreservation(multiData = data, 
+                                         multiColor = modules, 
+                                         verbose = verbose,
+                                         dataIsExpr = TRUE,
+                                         nPermutations = 200,
+                                         maxModuleSize = 1000, 
+                                         maxGoldModuleSize = 1000,
+                                         networkType = network_type,
+                                         parallelCalculation = TRUE)
+
+Cross_tabulation_overlap = WGCNA::overlapTable(modules_compare$module_postmerge,modules_compare$module_postmerge_TG)
+
+modules_cross_tabulation_all_vs_TG = Cross_tabulation_overlap$countTable |>
+  as.data.frame() 
+
+modules_cross_tabulation_all_vs_TG = modules_cross_tabulation_all_vs_TG |>
+  rownames_to_column("module") |>
+  pivot_longer(cols = where(is.numeric),names_to = "module_TG",values_to = "overlap") |>
+  filter(overlap != 0) |>
+  mutate(module_nr = as.integer(str_remove_all(module, "module_"))) |>
+  arrange(module_nr, desc(overlap))
+
+Cross_tabulation_overlap = WGCNA::overlapTable(modules_compare$module_postmerge,modules_compare$module_postmerge_DM)
+
+modules_cross_tabulation_all_vs_DM = Cross_tabulation_overlap$countTable |>
+  as.data.frame() 
+
+modules_cross_tabulation_all_vs_DM = modules_cross_tabulation_all_vs_DM |>
+  rownames_to_column("module") |>
+  pivot_longer(cols = where(is.numeric),names_to = "module_TG",values_to = "overlap") |>
+  filter(overlap != 0) |>
+  mutate(module_nr = as.integer(str_remove_all(module, "module_"))) |>
+  arrange(module_nr, desc(overlap))
+```
+
+
+# Module Preservation evaluation
+```{r}
+module_Zsummary_TG <- module_preservation$preservation$Z$ref.modules_all$inColumnsAlsoPresentIn.modules_TG |> rownames_to_column("module")
+
+module_tabulation_TG <- module_preservation$accuracy$observedCounts$ref.modules_all$inColumnsAlsoPresentIn.modules_TG |>
+  t() |> as.data.frame() |> 
+  rownames_to_column("module")
+
+module_Zsummary_DM <- module_preservation$preservation$Z$ref.modules_all$inColumnsAlsoPresentIn.modules_DM |> rownames_to_column("module")
+
+module_tabulation_DM <- module_preservation$accuracy$observedCounts$ref.modules_all$inColumnsAlsoPresentIn.modules_DM |>
+  t() |> as.data.frame() |> 
+  rownames_to_column("module")
+
+module_Zsummary <- module_Zsummary_TG |>
+  left_join(module_Zsummary_DM, by = c("module", "moduleSize")) |>
+  mutate(moduleSize_log10 = log10(moduleSize))
+
+colnames(module_Zsummary) <- gsub("[.]x", ".TG",colnames(module_Zsummary))
+colnames(module_Zsummary) <- gsub("[.]y", ".DM",colnames(module_Zsummary))
+
+ggplot(module_Zsummary, aes(x = Zsummary.pres.TG, y = Zsummary.pres.DM, colour = moduleSize_log10, group = module)) +
+  geom_point() + 
+  theme_bw() +
+  scale_x_log10() +
+  scale_y_log10() +
+  coord_fixed(ratio = 1) +
+  geom_hline(yintercept = c(2,10), colour = c("orange", "green")) +
+  geom_vline(xintercept = c(2,10), colour = c("orange", "green")) +
+  scale_color_gradientn(colours = rev(brewer.pal(9,"Spectral")))
+
+ggplotly(width = 1000,height = 1000)
+```
+
+
+
+# Save data
+```{r, include=FALSE}
+save(input, expression_data, expression_data_DM, expression_data_TG, module_definition, module_definition_DM, module_definition_TG,
+     file = file.path(outputDir, "WGCNA_TG_DM_rat_kidney_preservation_input.RData"))
+
+save(data, modules, modules_compare, module_preservation, modules_cross_tabulation_all_vs_DM, modules_cross_tabulation_all_vs_TG,
+     module_Zsummary_TG, module_Zsummary_DM, module_tabulation_TG, module_tabulation_DM,
+     file = file.path(outputDir, "WGCNA_TG_DM_rat_kidney_preservation_output.RData"))
+
+save.image(file.path(outputDir, "WGCNA_TG_DM_rat_kidney.RData"))
+```
+
