@@ -1,6 +1,6 @@
 /.Rproj.user
 *.RData
-*.xlsx
 *.csv
 *.txt
-*.pdf
+.Rhistory
+/WGCNA_TG_DM_rat_kidney_files

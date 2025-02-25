@@ -21,7 +21,7 @@ cutheight = 0.2 # Corresponds to a correlation threshold of 0.8 (1 - 0.8 = 0.2)
 verbose = 3
 network_type = "unsigned"
 method = "average"
-expression_file = "RG230-2.kidney_13582geneExpression_DM_TGexprs_brainarray.csv"
+expression_file = "RG230-2_kidney_13582_geneExpression_DM_TG_brainarray.csv.gz"
 ```
 
 
@@ -58,7 +58,7 @@ session_info()
 ```{r}
 # Step 1: Load your gene expression data
 # Assume the data is in a CSV file (rows: genes, columns: samples)
-input <- read.csv(file.path(inputDir, expression_file), header = T)
+input <- fread(file.path(inputDir, expression_file))
 
 experiment_info <- read_xlsx(file.path(inputDir, "kidney_experiments.xlsx"))
 
@@ -797,7 +797,7 @@ module_table_merging_DM <- module_definition_DM |>
 ```{r, include=FALSE}
 ## Preservation merged modules
 modules_compare = input |>
-  select(gene_symbol, geneid, probeset) |>
+  select(gene_symbol, geneid) |>
   mutate(entrez_id = paste0("id_", geneid)) |>
   left_join(module_definition |> 
               select(entrez_id, module_premerge, module_postmerge), 
